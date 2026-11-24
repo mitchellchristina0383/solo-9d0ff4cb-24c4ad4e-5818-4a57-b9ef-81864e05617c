@@ -18,6 +18,24 @@
   <span class="hint">CPU · SQLite 断点续训 · 小内存分组读取</span>
 </header>
 <main>
+  {% if emergency_state and emergency_state.active %}
+  <div class="emergency-banner emergency-phase-{{ emergency_state.phase or 'waiting' }}"
+       id="global-emergency-banner"
+       data-phase="{{ emergency_state.phase or '' }}">
+    {% if emergency_state.phase == 'exclusive' %}
+      🚨 <strong>紧急作业 #{{ emergency_state.emergency_run_id }} 独占中</strong>：
+      机器已交给该作业单独使用，紧急作业退出前其他启动请求一律退回。
+    {% else %}
+      ⏳ <strong>紧急作业 #{{ emergency_state.emergency_run_id }} 已受理 · 等待让位</strong>：
+      普通作业做完手头读取段及该段触发的组更新后让位，全部停稳才开始紧急训练；
+      期间其他启动请求一律退回。
+      {% if emergency_state.yield_ids %}
+        <span class="mono">待停稳：#{{ emergency_state.yield_ids | join('、#') }}</span>
+      {% endif %}
+    {% endif %}
+    <a class="banner-link" href="{{ url_for('run_detail', run_id=emergency_state.emergency_run_id) }}">查看紧急作业 →</a>
+  </div>
+  {% endif %}
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% for category, message in messages %}
       <div class="flash flash-{{ category }}">{{ message }}</div>

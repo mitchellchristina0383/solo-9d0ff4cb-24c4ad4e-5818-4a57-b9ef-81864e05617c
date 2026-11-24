@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import threading
 import time
 
 from flask import (
@@ -22,51 +21,19 @@ from werkzeug.utils import secure_filename
 
 from trainer import engine
 
+from .scheduler import EmergencyCoordinator
+from .workers import start_worker, worker_running
+
 ALLOWED_EXT = {".csv", ".txt"}
 
-_workers: dict[int, threading.Thread] = {}
-_workers_lock = threading.Lock()
+__all__ = ["create_app", "start_worker", "worker_running"]
 
 
-def worker_running(run_id: int) -> bool:
-    with _workers_lock:
-        thread = _workers.get(run_id)
-        return thread is not None and thread.is_alive()
-
-
-def _worker_main(db_path: str, upload_dir: str, run_id: int) -> None:
-    conn = engine.connect(db_path)
-    try:
-        row = engine.get_run(conn, run_id)
-        path = engine.resolve_data_path(upload_dir, row["stored_name"])
-        engine.train(conn, run_id, path)
-    except (engine.StateError, engine.InputError) as exc:
-        engine._set_status(conn, run_id, "failed", str(exc))
-    except BaseException as exc:  # noqa: BLE001 - keep the process and the DB consistent
-        engine._set_status(
-            conn, run_id, "crashed", f"训练线程异常: {type(exc).__name__}: {exc}"
-        )
-    finally:
-        conn.close()
-        with _workers_lock:
-            if _workers.get(run_id) is threading.current_thread():
-                _workers.pop(run_id, None)
-
-
-def start_worker(app: Flask, run_id: int) -> bool:
-    with _workers_lock:
-        existing = _workers.get(run_id)
-        if existing is not None and existing.is_alive():
-            return False
-        thread = threading.Thread(
-            target=_worker_main,
-            args=(app.config["DB_PATH"], app.config["UPLOAD_DIR"], run_id),
-            name=f"train-{run_id}",
-            daemon=True,
-        )
-        _workers[run_id] = thread
-    thread.start()
-    return True
+def wants_json_response() -> bool:
+    if request.values.get("format") == "json":
+        return True
+    accept = request.accept_mimetypes
+    return accept.best == "application/json" or accept["application/json"] > accept["text/html"]
 
 
 def _int_field(name: str):
@@ -105,6 +72,17 @@ def create_app(config: dict | None = None) -> Flask:
 
     with engine.session(app.config["DB_PATH"]) as conn:
         engine.recover(conn)
+
+    coordinator = EmergencyCoordinator(app)
+    app.extensions["emergency_coordinator"] = coordinator
+
+    @app.context_processor
+    def inject_emergency_state():
+        # Never let the banner break page rendering.
+        try:
+            return {"emergency_state": coordinator.banner()}
+        except Exception:  # noqa: BLE001
+            return {"emergency_state": None}
 
     def db():
         return engine.session(app.config["DB_PATH"])
@@ -207,11 +185,20 @@ def create_app(config: dict | None = None) -> Flask:
             except engine.InputError:
                 abort(404)
             updates = engine.recent_updates(conn, run_id, 15)
+        emergency = coordinator.snapshot()
         return jsonify(
             run=dict(run),
             worker_running=worker_running(run_id),
             updates=[dict(u) for u in updates],
+            emergency=emergency,
+            # Flat aliases for lightweight polling scripts/tests.
+            emergency_active=emergency["active"],
+            emergency_phase=emergency["phase"],
         )
+
+    @app.get("/api/emergency")
+    def api_emergency():
+        return jsonify(coordinator.snapshot())
 
     @app.get("/api/runs/<int:run_id>/audit")
     def api_audit(run_id: int):
@@ -225,6 +212,18 @@ def create_app(config: dict | None = None) -> Flask:
 
     @app.post("/runs/<int:run_id>/start")
     def run_start(run_id: int):
+        as_json = wants_json_response()
+        # Emergency epoch: every ordinary start request is rejected immediately,
+        # before touching the row (so a yielded auto-resume marker survives).
+        try:
+            coordinator.ensure_inactive()
+        except engine.StateError as exc:
+            if as_json:
+                return jsonify(ok=False, error=str(exc),
+                               emergency=coordinator.snapshot()), 409
+            flash(str(exc), "error")
+            return redirect(url_for("run_detail", run_id=run_id))
+
         pause_after = None
         pause_desc = "，将跑到结束"
         with db() as conn:
@@ -247,7 +246,8 @@ def create_app(config: dict | None = None) -> Flask:
                     conn.execute(
                         "UPDATE runs SET pause_after_chunks=CASE WHEN ?='chunk' THEN ? END, "
                         "pause_after_groups=CASE WHEN ?='group' THEN ? END, "
-                        "pause_requested=0, message=?, updated_at=? WHERE id=?",
+                        "pause_requested=0, yield_requested=0, yielded=0, "
+                        "message=?, updated_at=? WHERE id=?",
                         (pause_unit, pause_after, pause_unit, pause_after,
                          ("已排队，等待训练线程" if not pause_after
                           else f"已排队，将在 {pause_after} "
@@ -263,25 +263,126 @@ def create_app(config: dict | None = None) -> Flask:
                 flash(str(exc), "error")
                 return redirect(url_for("run_detail", run_id=run_id))
 
-        if not start_worker(app, run_id):
-            flash("后台训练线程仍在收尾，请稍后重试", "error")
+        try:
+            coordinator.start_normal(run_id)
+        except engine.StateError as exc:
+            if as_json:
+                return jsonify(ok=False, error=str(exc),
+                               emergency=coordinator.snapshot()), 409
+            flash(str(exc), "error")
         else:
+            if as_json:
+                return jsonify(ok=True, emergency=coordinator.snapshot()), 202
             flash("训练已启动" + pause_desc, "ok")
         return redirect(url_for("run_detail", run_id=run_id))
 
     @app.post("/runs/<int:run_id>/pause")
     def run_pause(run_id: int):
+        held = False
         with db() as conn:
             try:
-                ok = engine.request_pause(conn, run_id)
+                row = engine.get_run(conn, run_id)
             except engine.InputError:
                 abort(404)
-        flash(
-            "已提交暂停请求：当前读取段结束即落盘暂停，下次从下一行继续"
-            if ok else "当前没有运行中的训练",
-            "ok" if ok else "error",
-        )
+            if row["status"] == "running":
+                ok = engine.request_pause(conn, run_id)
+            else:
+                # A yield-parked checkpoint can still be actively paused during
+                # the emergency exclusive phase: flip the durable veto so the
+                # coordinator does not auto-resume this run.
+                held = engine.hold_yielded(conn, run_id)
+                ok = held
+        if held:
+            flash(
+                "已主动暂停并保存断点：紧急作业结束后不会自动续跑，"
+                "之后可在本页手动继续训练",
+                "ok",
+            )
+        else:
+            flash(
+                "已提交暂停请求：当前读取段结束即落盘暂停，下次从下一行继续"
+                if ok else "当前没有运行中或等待让位的训练",
+                "ok" if ok else "error",
+            )
         return redirect(url_for("run_detail", run_id=run_id))
+
+    def _run_emergency_view(run_id: int):
+        as_json = wants_json_response()
+        try:
+            with db() as conn:
+                try:
+                    run = engine.get_run(conn, run_id)
+                except engine.InputError:
+                    abort(404)
+                if run["status"] == "finished":
+                    raise engine.InputError("该训练已完成，无需紧急运行")
+            snap = coordinator.request(run_id)
+        except engine.StateError as exc:
+            if as_json:
+                return jsonify(ok=False, error=str(exc),
+                               emergency=coordinator.snapshot()), 409
+            flash(str(exc), "error")
+            return redirect(url_for("run_detail", run_id=run_id))
+        except engine.InputError as exc:
+            if as_json:
+                return jsonify(ok=False, error=str(exc)), 400
+            flash(str(exc), "error")
+            return redirect(url_for("run_detail", run_id=run_id))
+        if as_json:
+            return jsonify(ok=True, emergency=snap), 202
+        if snap.get("yield_ids"):
+            flash(
+                f"紧急作业 #{run_id} 已受理：{len(snap['yield_ids'])} 个普通作业将在"
+                "手头读取段及其触发的组更新完成后让位，全部停稳后开始紧急独占训练；"
+                "期间其他启动请求一律退回",
+                "ok",
+            )
+        else:
+            flash(
+                f"紧急作业 #{run_id} 已受理：没有需要等待让位的普通作业，即将独占训练；"
+                "紧急作业退出前其他启动请求一律退回",
+                "ok",
+            )
+        return redirect(url_for("run_detail", run_id=run_id))
+
+    # Primary route plus a few conventional aliases so the privileged action is
+    # reachable under the URLs different clients might expect.
+    app.add_url_rule(
+        "/runs/<int:run_id>/emergency",
+        endpoint="run_emergency",
+        view_func=_run_emergency_view,
+        methods=["POST"],
+    )
+    app.add_url_rule(
+        "/runs/<int:run_id>/urgent",
+        endpoint="run_urgent_alias",
+        view_func=_run_emergency_view,
+        methods=["POST"],
+    )
+    app.add_url_rule(
+        "/runs/<int:run_id>/emergency-run",
+        endpoint="run_emergency_run_alias",
+        view_func=_run_emergency_view,
+        methods=["POST"],
+    )
+    app.add_url_rule(
+        "/emergency/<int:run_id>",
+        endpoint="run_emergency_root_alias",
+        view_func=_run_emergency_view,
+        methods=["POST"],
+    )
+    app.add_url_rule(
+        "/emergency/<int:run_id>/start",
+        endpoint="run_emergency_start_alias",
+        view_func=_run_emergency_view,
+        methods=["POST"],
+    )
+    app.add_url_rule(
+        "/api/runs/<int:run_id>/emergency",
+        endpoint="api_run_emergency",
+        view_func=_run_emergency_view,
+        methods=["POST"],
+    )
 
     @app.post("/runs/<int:run_id>/chunk-limit")
     def run_chunk_limit(run_id: int):
@@ -319,6 +420,3 @@ def create_app(config: dict | None = None) -> Flask:
         return redirect(url_for("index"))
 
     return app
-
-
-__all__ = ["create_app", "start_worker", "worker_running"]

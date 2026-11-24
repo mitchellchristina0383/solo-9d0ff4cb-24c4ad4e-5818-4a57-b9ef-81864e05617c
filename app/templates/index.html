@@ -53,7 +53,14 @@
       <tr>
         <td>{{ r.id }}</td>
         <td class="mono">{{ r.original_name }}</td>
-        <td>{{ status_badge(r.status) }}</td>
+        <td>
+          {{ status_badge(r.status) }}
+          {% if r.yield_requested and r.status == 'running' %}
+            <br><span class="badge badge-yield pulse" style="margin-top:3px">等待让位</span>
+          {% elif r.yielded %}
+            <br><span class="badge badge-yielded" style="margin-top:3px">已让位</span>
+          {% endif %}
+        </td>
         <td>{{ r.updates_done }}</td>
         <td>{{ r.samples_done }} / {{ r.total_rows }}</td>
         <td class="mono">{{ '%.8g'|format(r.w) }}</td>

@@ -86,6 +86,10 @@ CREATE TABLE IF NOT EXISTS runs (
     pause_after_chunks INTEGER,                -- pause once this many chunks are read (per session)
     pause_after_groups INTEGER,                -- or pause after this many group updates (per session)
     pause_requested    INTEGER NOT NULL DEFAULT 0,
+    yield_requested    INTEGER NOT NULL DEFAULT 0,  -- emergency asks this worker to yield at boundary
+    yielded            INTEGER NOT NULL DEFAULT 0,  -- parked after preemption; auto-resume eligible
+    emergency          INTEGER NOT NULL DEFAULT 0,  -- this run is the emergency job
+    stop_kind          TEXT NOT NULL DEFAULT '',    -- user|schedule|yield|finished ...
     chunks_read        INTEGER NOT NULL DEFAULT 0,
     peak_rows_held     INTEGER NOT NULL DEFAULT 0,
     peak_rss_kb        INTEGER NOT NULL DEFAULT 0,
@@ -133,6 +137,10 @@ _ADDED_COLUMNS = {
     "peak_rows_held": "INTEGER NOT NULL DEFAULT 0",
     "peak_rss_kb": "INTEGER NOT NULL DEFAULT 0",
     "last_group_ms": "REAL NOT NULL DEFAULT 0",
+    "yield_requested": "INTEGER NOT NULL DEFAULT 0",
+    "yielded": "INTEGER NOT NULL DEFAULT 0",
+    "emergency": "INTEGER NOT NULL DEFAULT 0",
+    "stop_kind": "TEXT NOT NULL DEFAULT ''",
 }
 
 
@@ -369,12 +377,24 @@ def recover(conn: sqlite3.Connection) -> int:
     The row already points at the last group commit (or last deliberate pause),
     so nothing else has to be repaired; the flag just tells the UI why it is
     not running any more.
+
+    Emergency coordination is process-local (threads), so after a restart there
+    is no coordinator to auto-resume yielded jobs.  Yielded rows are already
+    checkpointed ``paused`` runs: drop the auto-resume marker but keep every
+    number/offset, and let the operator resume manually from the checkpoint.
     """
     with transaction(conn):
         cur = conn.execute(
             "UPDATE runs SET status='crashed', updated_at=?, "
             "message='上次进程在训练中被终止；已回退到最后一个已提交的组边界，可继续训练' "
             "WHERE status='running'",
+            (_now(),),
+        )
+        conn.execute("UPDATE runs SET yield_requested=0 WHERE yield_requested<>0")
+        conn.execute(
+            "UPDATE runs SET yielded=0, stop_kind='restart', updated_at=?, "
+            "message='服务已重启：让位断点已保留，不会自动续跑，请手动继续训练' "
+            "WHERE yielded=1",
             (_now(),),
         )
         return cur.rowcount
@@ -538,6 +558,7 @@ class TrainResult:
     v_b: float
     part_rows: int = 0
     chunks_this_session: int = 0
+    kind: str = ""
 
 
 def _peak_rss_kb() -> int:
@@ -626,11 +647,17 @@ def train(
     groups_session = 0
     status = "paused"
     message = "训练未产生新的更新"
+    stop_kind = ""
 
     with transaction(conn):
+        # NOTE: yield_requested is deliberately preserved here: an emergency can
+        # arm it between thread registration and this transaction, and the first
+        # boundary check must observe it.  yielded is cleared because a live
+        # worker now owns the run.
         cur = conn.execute(
-            "UPDATE runs SET status='running', pause_requested=0, message='训练中', "
-            "updated_at=? WHERE id=? AND status IN ('ready','paused','crashed')",
+            "UPDATE runs SET status='running', pause_requested=0, yielded=0, "
+            "message='训练中', updated_at=? "
+            "WHERE id=? AND status IN ('ready','paused','crashed')",
             (_now(), run_id),
         )
         if cur.rowcount == 0:
@@ -638,18 +665,23 @@ def train(
     if progress:
         progress({"event": "status", "status": "running", "message": "训练中"})
 
-    def pause_check() -> Optional[str]:
+    def pause_check() -> Optional[tuple[str, str]]:
         row = conn.execute(
-            "SELECT pause_requested FROM runs WHERE id=?", (run_id,)
+            "SELECT pause_requested, yield_requested FROM runs WHERE id=?", (run_id,)
         ).fetchone()
         if row["pause_requested"]:
-            return "收到暂停请求：已在当前读取段结束后暂停，下次从下一行继续"
+            return "user", "收到暂停请求：已在当前读取段结束后暂停，下次从下一行继续"
         if max_updates is not None and groups_session >= max_updates:
-            return f"本次运行达到更新上限（{max_updates} 组）：已在组边界暂停"
+            return "max_updates", f"本次运行达到更新上限（{max_updates} 组）：已在组边界暂停"
         if group_budget is not None and groups_session >= group_budget:
-            return f"本次已完成 {group_budget} 组更新：按设置暂停"
+            return "group", f"本次已完成 {group_budget} 组更新：按设置暂停"
         if chunk_budget is not None and chunks_session >= chunk_budget:
-            return f"本次已读完 {chunk_budget} 段：按设置暂停，下次从下一行继续"
+            return "chunk", f"本次已读完 {chunk_budget} 段：按设置暂停，下次从下一行继续"
+        if row["yield_requested"]:
+            return "yield", (
+                "紧急作业优先：已做完手头读取段及该段触发的组更新并让位，"
+                "断点已保存，紧急作业结束后自动续跑"
+            )
         return None
 
     try:
@@ -657,7 +689,8 @@ def train(
             while samples_done + part.rows < total:
                 reason = pause_check()
                 if reason:
-                    status, message = "paused", reason
+                    stop_kind, message = reason
+                    status = "paused"
                     break
                 group_total = min(group_size, total - samples_done)
                 want = min(group_total - part.rows, chunk_limit)
@@ -776,19 +809,50 @@ def train(
                     })
             else:
                 status, message = "finished", "训练完成"
+                stop_kind = "finished"
 
         # Persist final state.  For a pause this also checkpoints the partial
         # group so the next session resumes at `offset` (the next row).
+        if stop_kind == "yield":
+            # Emergency preemption.  The configured segment/group pause budget is
+            # session-counted; rewrite it to the *remaining* count so the
+            # coordinator's automatic resume keeps counting towards the same
+            # target instead of starting a fresh budget.
+            if chunk_budget is not None:
+                left_chunks = chunk_budget - chunks_session
+                chunk_budget = left_chunks if left_chunks > 0 else None
+            if group_budget is not None:
+                left_groups = group_budget - groups_session
+                group_budget = left_groups if left_groups > 0 else None
+
         with transaction(conn):
+            yielded_flag = 1 if stop_kind == "yield" else 0
+            if stop_kind == "yield":
+                # Race guard: an explicit pause landing in the same instant wins
+                # and converts this stop into a user pause (no auto-resume).
+                late = conn.execute(
+                    "SELECT pause_requested FROM runs WHERE id=?", (run_id,)
+                ).fetchone()
+                if late is not None and late["pause_requested"]:
+                    stop_kind = "user"
+                    yielded_flag = 0
+                    message = "收到主动暂停请求：已在让位边界暂停并落盘，紧急作业结束后不自动续跑"
             conn.execute(
                 "UPDATE runs SET status=?, message=?, pause_requested=0, "
+                "yield_requested=0, yielded=?, stop_kind=?, "
                 "next_offset=?, part_rows=?, part_gw=?, part_gb=?, part_loss=?, "
                 "part_start_offset=?, chunks_read=?, "
+                "pause_after_chunks=CASE WHEN ?=1 THEN ? ELSE pause_after_chunks END, "
+                "pause_after_groups=CASE WHEN ?=1 THEN ? ELSE pause_after_groups END, "
                 "peak_rows_held=MAX(peak_rows_held, ?), peak_rss_kb=MAX(peak_rss_kb, ?), "
                 "updated_at=?, finished_at=CASE WHEN ?='finished' THEN ? ELSE finished_at END "
                 "WHERE id=?",
-                (status, message, offset, part.rows, part.gw, part.gb, part.loss,
-                 part.start_offset, chunks_total, peak_rows_held, _peak_rss_kb(),
+                (status, message, yielded_flag, stop_kind,
+                 offset, part.rows, part.gw, part.gb, part.loss,
+                 part.start_offset, chunks_total,
+                 yielded_flag, chunk_budget,
+                 yielded_flag, group_budget,
+                 peak_rows_held, _peak_rss_kb(),
                  _now(), status, _now(), run_id),
             )
     except KeyboardInterrupt:
@@ -813,7 +877,7 @@ def train(
     if progress:
         progress({"event": "status", "status": status, "message": message})
     return TrainResult(status, message, updates_done, samples_done, total,
-                       w, b, v_w, v_b, part.rows, chunks_session)
+                       w, b, v_w, v_b, part.rows, chunks_session, stop_kind)
 
 
 def set_chunk_limit(conn: sqlite3.Connection, run_id: int, chunk_limit: int) -> None:
@@ -866,6 +930,122 @@ def request_pause(conn: sqlite3.Connection, run_id: int) -> bool:
             (_now(), run_id),
         )
         return cur.rowcount > 0
+
+
+YIELD_MESSAGE = (
+    "紧急作业已受理：将在做完手头读取段及该段触发的组更新后让位，"
+    "断点保存后由紧急作业通道自动续跑"
+)
+HELD_MESSAGE = "已主动暂停并保存断点；紧急作业结束后不自动续跑，可在本页手动继续训练"
+AUTO_RESUME_MESSAGE = "紧急作业已完成/退出：因让位停下且未主动暂停，现自动续跑（原定段/组暂停计数继续计算）"
+
+
+def request_yield(conn: sqlite3.Connection, run_id: int) -> bool:
+    """Ask one live worker to yield at its next legal boundary."""
+    with transaction(conn):
+        cur = conn.execute(
+            "UPDATE runs SET yield_requested=1, message=?, updated_at=? "
+            "WHERE id=? AND status='running'",
+            (YIELD_MESSAGE, _now(), run_id),
+        )
+        return cur.rowcount > 0
+
+
+def arm_emergency(
+    conn: sqlite3.Connection,
+    emergency_id: int,
+    live_worker_ids: Optional[list[int]] = None,
+) -> list[int]:
+    """Accept an emergency request.
+
+    Marks every currently-running ordinary job, plus every run that already has
+    a live worker thread (covers the thread-registered / not-yet-running
+    race), to yield.  The emergency run itself is never marked.  Returns the
+    deduplicated ids asked to yield.
+    """
+    live = {int(i) for i in (live_worker_ids or []) if int(i) != emergency_id}
+    with transaction(conn):
+        get_run(conn, emergency_id)  # existence / 404
+        conn.execute(
+            "UPDATE runs SET emergency=1, updated_at=? WHERE id=?",
+            (_now(), emergency_id),
+        )
+        conn.execute(
+            "UPDATE runs SET yield_requested=1, message=?, updated_at=? "
+            "WHERE status='running' AND id<>?",
+            (YIELD_MESSAGE, _now(), emergency_id),
+        )
+        if live:
+            placeholders = ",".join("?" for _ in live)
+            conn.execute(
+                f"UPDATE runs SET yield_requested=1, message=?, updated_at=? "
+                f"WHERE id IN ({placeholders}) AND id<>?",
+                (YIELD_MESSAGE, _now(), *live, emergency_id),
+            )
+        rows = conn.execute(
+            "SELECT id FROM runs WHERE yield_requested=1 AND id<>? ORDER BY id",
+            (emergency_id,),
+        ).fetchall()
+        return [int(r["id"]) for r in rows]
+
+
+def prepare_emergency_run(conn: sqlite3.Connection, emergency_id: int) -> None:
+    """Clear session pause budgets so the emergency job runs until done/paused."""
+    with transaction(conn):
+        get_run(conn, emergency_id)
+        conn.execute(
+            "UPDATE runs SET pause_after_chunks=NULL, pause_after_groups=NULL, "
+            "pause_requested=0, updated_at=? WHERE id=?",
+            (_now(), emergency_id),
+        )
+
+
+def hold_yielded(conn: sqlite3.Connection, run_id: int) -> bool:
+    """Explicitly pause a yield-parked checkpoint: vetoes automatic resume.
+
+    The checkpoint was already persisted when the worker yielded, so this only
+    flips the bookkeeping flags.  Also works as the durable veto if the
+    coordinator races the auto-resume sweep (pause_requested is left set and
+    take_yielded skips such rows).
+    """
+    with transaction(conn):
+        row = get_run(conn, run_id)
+        if row["status"] == "running":
+            # Worker still live: route through the normal cooperative pause.
+            conn.execute(
+                "UPDATE runs SET pause_requested=1, yielded=0, "
+                "message='暂停请求已提交：将在当前读取段/组边界暂停并落盘，且紧急作业结束后不自动续跑', "
+                "updated_at=? WHERE id=?",
+                (_now(), run_id),
+            )
+            return True
+        cur = conn.execute(
+            "UPDATE runs SET yielded=0, yield_requested=0, pause_requested=1, "
+            "stop_kind='user_hold', message=?, updated_at=? "
+            "WHERE id=? AND status='paused' AND yielded=1",
+            (HELD_MESSAGE, _now(), run_id),
+        )
+        return cur.rowcount > 0
+
+
+def take_yielded(conn: sqlite3.Connection, emergency_id: int) -> list[int]:
+    """Atomically claim yield-parked jobs eligible for automatic resume."""
+    with transaction(conn):
+        rows = conn.execute(
+            "SELECT id FROM runs WHERE yielded=1 AND COALESCE(pause_requested,0)=0 "
+            "AND id<>? ORDER BY id",
+            (emergency_id,),
+        ).fetchall()
+        ids = [int(r["id"]) for r in rows]
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(
+                f"UPDATE runs SET yielded=0, yield_requested=0, pause_requested=0, "
+                f"stop_kind='auto_resume', message=?, updated_at=? "
+                f"WHERE id IN ({placeholders}) AND yielded=1",
+                (AUTO_RESUME_MESSAGE, _now(), *ids),
+            )
+        return ids
 
 
 def delete_run(conn: sqlite3.Connection, run_id: int) -> sqlite3.Row:

@@ -3,13 +3,35 @@
 {% block content %}
 <div id="run" data-run-id="{{ run.id }}"
      data-worker-running="{{ '1' if worker_running else '0' }}"
-     data-status="{{ run.status }}">
+     data-status="{{ run.status }}"
+     data-yielded="{{ run.yielded or 0 }}"
+     data-yield-requested="{{ run.yield_requested or 0 }}"
+     data-emergency-active="{{ '1' if emergency_state and emergency_state.active else '0' }}"
+     data-sig="{{ run.status }}|{{ '1' if worker_running else '0' }}|{{ run.yielded or 0 }}|{{ run.yield_requested or 0 }}|{{ run.pause_requested or 0 }}|{{ '1' if emergency_state and emergency_state.active else '0' }}|{{ emergency_state.phase if emergency_state and emergency_state.active and emergency_state.phase else '' }}|{{ emergency_state.emergency_run_id if emergency_state and emergency_state.active and emergency_state.emergency_run_id else '' }}">
 <section class="card">
   <div class="headline">
     <h1>训练 #{{ run.id }} · <span class="mono">{{ run.original_name }}</span></h1>
     {{ status_badge(run.status) }}
+    {% if run.emergency and run.status == 'running' %}
+      <span class="badge badge-emergency">🚨 紧急 · 独占中</span>
+    {% elif run.emergency %}
+      <span class="badge badge-emergency-soft">紧急作业</span>
+    {% endif %}
+    {% if run.yield_requested and run.status == 'running' %}
+      <span class="badge badge-yield pulse">⏳ 等待让位</span>
+    {% endif %}
+    {% if run.yielded %}
+      <span class="badge badge-yielded">已让位 · 紧急结束后自动续跑</span>
+    {% endif %}
   </div>
   <p class="muted" id="message">{{ run.message }}</p>
+
+  {% if run.yielded %}
+  <p class="yield-note">
+    该作业已在读取段/组更新边界落盘让位，断点完整保留；紧急作业退出后会自动续跑，
+    原定按段/按组暂停的剩余计数继续计算。若现在点「主动暂停」，则转为手动暂停、不再自动续跑。
+  </p>
+  {% endif %}
 
   <div class="metrics">
     <div class="metric"><span class="label">更新次数</span><span id="m-updates" class="value">{{ run.updates_done }}</span></div>
@@ -56,15 +78,32 @@ v_b = {{ '%.17g'|format(run.v_b) }}</pre>
       <label>单次读入上限（可改小）
         <input type="number" name="chunk_limit" min="1" step="1" value="{{ run.chunk_limit }}">
       </label>
-      <button type="submit" class="primary" {% if run.status in ['finished','failed'] or worker_running %}disabled{% endif %}>
+      <button type="submit" class="primary"
+              {% if run.status in ['finished','failed'] or worker_running or (emergency_state and emergency_state.active) %}disabled{% endif %}>
         {% if run.status in ['ready'] %}开始训练{% else %}继续训练{% endif %}
       </button>
+      {% if emergency_state and emergency_state.active %}
+        <small class="emergency-inline">紧急通道处理中：启动请求已退回，请等紧急作业退出后再普通启动。</small>
+      {% endif %}
+    </form>
+
+    <form method="post" action="{{ url_for('run_emergency', run_id=run.id) }}" class="inline emergency-form"
+          onsubmit="return confirm('对训练 #{{ run.id }} 发起紧急运行？\n\n· 受理后到紧急作业退出前，其他启动请求一律退回；\n· 运行中的普通作业做完手头读取段及该段触发的组更新后让位；\n· 全部停稳后本作业独占训练；\n· 紧急作业完成/暂停/失败后，只自动续跑因让位停下且未主动暂停的作业。');">
+      <button type="submit" class="emergency"
+              {% if run.status == 'finished' or (emergency_state and emergency_state.active) %}disabled{% endif %}>
+        🚨 紧急运行
+      </button>
+      <small class="muted">选中作业优先、独占机器；普通作业在当前读取段及其组更新提交后让位</small>
     </form>
 
     <form method="post" action="{{ url_for('run_pause', run_id=run.id) }}" class="inline"
           onsubmit="return confirm('请求在当前读取段结束后暂停？');">
-      <button type="submit" {% if not worker_running %}disabled{% endif %}>主动暂停</button>
-      <small class="muted">当前读取段结束后落盘停止，下次从下一行续训</small>
+      <button type="submit"
+              {% if not worker_running and not run.yielded %}disabled{% endif %}>主动暂停</button>
+      <small class="muted">
+        {% if run.yielded %}已让位待命：点此转为主动暂停并保存断点，紧急结束后不自动续跑
+        {% else %}当前读取段结束后落盘停止，下次从下一行续训；等待让位/独占期间同样可用{% endif %}
+      </small>
     </form>
 
     <form method="post" action="{{ url_for('run_chunk_limit', run_id=run.id) }}" class="inline">
